@@ -1,3 +1,4 @@
 *.json
 *example*.md
 *introspection*.md
+*operation*.md
