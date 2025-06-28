@@ -31,3 +31,5 @@ All metadata fetched from the following providers is to be used and creditted fo
 Metadata provided by IMDb. Please consider [adding missing information](https://help.imdb.com/article/contribution/contribution-information/adding-new-data/G6BXD2JFDCCETUF4).
 
 This interface is provided free of charge and is not intended to be used for commercial and/or for profit projects. If you wish to use this implementation for that, you must comply with IMDb's terms for gaining access for that type. [Getting Commercial/Paid API Access](https://developer.imdb.com/documentation/api-documentation/getting-access/?ref_=up_next)
+
+Thanks @MiM-MiM for unknowingly giving me the idea, and some readme/image
