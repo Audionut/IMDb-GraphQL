@@ -858,18 +858,18 @@ def generate_example_query_for_operation(operation_name, search_term):
 
     # Create variable definitions
     var_definitions = []
-    if 'constraints' in variables:
-        constraint_arg = next(arg for arg in args if 'constraint' in arg.get('name', '').lower())
-        constraint_type = constraint_arg.get('type', '').replace('!', '').strip()
-        var_definitions.append(f"$constraints: {constraint_type}")
-    if 'first' in variables:
-        var_definitions.append("$first: Int")
-    if 'after' in variables:
-        var_definitions.append("$after: ID")
-    if 'sort' in variables:
-        sort_arg = next((arg for arg in args if 'sort' in arg.get('name', '').lower()), None)
-        if sort_arg:
-            sort_type = sort_arg.get('type', '').replace('!', '').strip()
+    for arg in args:
+        arg_name = arg.get('name', '')
+        arg_type = arg.get('type', '')
+        if arg_name == 'constraints' and 'constraints' in variables:
+            constraint_type = arg_type.replace('!', '').strip()
+            var_definitions.append(f"$constraints: {constraint_type}")
+        elif arg_name == 'first' and 'first' in variables:
+            var_definitions.append(f"$first: {arg_type}")
+        elif arg_name == 'after' and 'after' in variables:
+            var_definitions.append(f"$after: {arg_type}")
+        elif 'sort' in arg_name.lower() and 'sort' in variables:
+            sort_type = arg_type.replace('!', '').strip()
             var_definitions.append(f"$sort: {sort_type}")
 
     # Build the complete query
@@ -917,59 +917,79 @@ def build_example_constraints_for_search(constraint_type, search_term, operation
 
     example_constraints = {}
 
-    # Analyze constraint fields and build appropriate example
+    # STRICT: Only process fields that actually exist on THIS constraint type
     for field in constraint_fields:
         field_name = field.get('name', '')
+        field_type = field.get('type', '')
         field_name_lower = field_name.lower()
+        is_required = field_type.endswith('!')
 
-        # Primary search term constraint
-        if any(keyword in field_name_lower for keyword in ['nametext', 'titletext', 'text', 'search']):
-            if 'name' in field_name_lower:
-                example_constraints['nameTextConstraint'] = {
-                    "searchTerm": search_term
-                }
-            elif 'title' in field_name_lower:
-                example_constraints['titleTextConstraint'] = {
-                    "searchTerm": search_term
-                }
+        # Get clean type
+        clean_type = field_type.replace('!', '').replace('[', '').replace(']', '').strip()
+        
+        # Handle scalar types first
+        if clean_type in ['ID', 'String', 'Int', 'Boolean']:
+            if clean_type == 'ID':
+                example_constraints[field_name] = "example_id"
+            elif clean_type == 'String':
+                example_constraints[field_name] = search_term if 'search' in field_name_lower else "example"
+            elif clean_type == 'Int':
+                example_constraints[field_name] = 1
+            elif clean_type == 'Boolean':
+                example_constraints[field_name] = True
+                
+        # Handle input objects recursively
+        elif clean_type in detailed_introspection_data and detailed_introspection_data[clean_type].get('kind') == 'INPUT_OBJECT':
+            nested_example = build_example_constraints_for_search(clean_type, search_term, operation_name)
+            if nested_example:
+                example_constraints[field_name] = nested_example
+                
+        # Handle enums and other special types
+        elif clean_type in detailed_introspection_data:
+            nested_data = detailed_introspection_data[clean_type]
+            if nested_data.get('kind') == 'ENUM':
+                # For enums, only include if we have valid enum values
+                enum_values = nested_data.get('enumValues', [])
+                if enum_values and len(enum_values) > 0:
+                    first_enum_value = enum_values[0].get('name')
+                    if first_enum_value:
+                        example_constraints[field_name] = first_enum_value
+                        print(f"Debug: Using enum value '{first_enum_value}' for field '{field_name}'")
+                    else:
+                        print(f"Debug: Skipping enum field '{field_name}' - invalid enum value")
+                else:
+                    print(f"Debug: Skipping enum field '{field_name}' - no enum values available")
+                # Don't add this field to example_constraints if we don't have valid values
+                continue
+        elif 'award' in field_name_lower or 'event' in field_name_lower or 'id' in field_name_lower:
+            # Skip constraints that need real IDs for examples
+            print(f"Debug: Skipping constraint field '{field_name}' - requires real entity ID")
+            continue
+        # Smart defaults based on field names for unknown types
+        elif 'year' in field_name_lower:
+            example_constraints[field_name] = 1970
+        elif 'date' in field_name_lower:
+            if 'min' in field_name_lower or 'start' in field_name_lower:
+                example_constraints[field_name] = "1960-01-01"
+            elif 'max' in field_name_lower or 'end' in field_name_lower:
+                example_constraints[field_name] = "1970-12-31"
             else:
-                example_constraints[field_name] = {
-                    "searchTerm": search_term
-                }
-
-        # Additional useful constraints for demonstration
-        elif 'profession' in field_name_lower and len(example_constraints) < 3:
-            example_constraints[field_name] = {
-                "anyProfessions": ["ACTOR", "PRODUCER"]
-            }
-
-        elif 'birthdate' in field_name_lower and len(example_constraints) < 3:
-            example_constraints[field_name] = {
-                "start": "1960-01-01",
-                "end": "1970-12-31"
-            }
-
-        elif 'year' in field_name_lower and len(example_constraints) < 3:
-            example_constraints[field_name] = {
-                "start": 1990,
-                "end": 2000
-            }
-
-        elif 'gender' in field_name_lower and len(example_constraints) < 3:
+                example_constraints[field_name] = "1965-01-01"
+        elif 'gender' in field_name_lower:
             example_constraints[field_name] = "MALE"
+        elif is_required:
+            # For required fields of unknown types, provide safe defaults
+            if clean_type == "String":
+                example_constraints[field_name] = "example"
+            elif clean_type == "Int":
+                example_constraints[field_name] = 1
+            elif clean_type == "Boolean":
+                example_constraints[field_name] = True
+            elif clean_type == "ID":
+                example_constraints[field_name] = "example_id"
 
-    # Ensure we have at least one constraint
-    if not example_constraints:
-        if 'name' in operation_name.lower():
-            example_constraints['nameTextConstraint'] = {
-                "searchTerm": search_term
-            }
-        elif 'title' in operation_name.lower():
-            example_constraints['titleTextConstraint'] = {
-                "searchTerm": search_term
-            }
-
-    return example_constraints
+    # Only return non-empty constraints
+    return example_constraints if example_constraints else None
 
 
 def build_example_sort(sort_type, operation_name):
@@ -2318,12 +2338,14 @@ def build_validated_connection_query(connection_type, depth, visited_types, limi
     
     # Build node query with STRICT validation against the actual node type schema
     node_fields = []
-    node_fields.append(f"{node_indent}id")
     
     # Get the ACTUAL fields from the node type's schema
     node_data = detailed_introspection_data[node_type]
     actual_node_fields = node_data.get('fields', [])
-    
+    id_field = next((f for f in actual_node_fields if f['name'] == 'id'), None)
+    if id_field:
+        node_fields.append(f"{node_indent}id")
+
     if not actual_node_fields:
         print(f"Warning: No fields found for node type '{node_type}'")
         return build_simple_connection_with_id_only(depth)
@@ -2374,12 +2396,11 @@ def build_validated_connection_query(connection_type, depth, visited_types, limi
     # Add priority scalar fields - ONLY those verified for this node type
     max_node_fields = 2 if limit_fields else 3  # Very conservative
     priority_scalars, regular_scalars = prioritize_scalar_fields(verified_scalar_fields)
-    
+
     fields_added = 0
     for field in priority_scalars[:max_node_fields]:
         if fields_added >= max_node_fields:
             break
-        
         field_name = field['name']
         # Final verification that this field exists in THIS node type
         if verify_field_exists_in_type(field_name, node_type):
@@ -2388,7 +2409,18 @@ def build_validated_connection_query(connection_type, depth, visited_types, limi
             print(f"Debug: Added verified scalar field '{field_name}' to '{node_type}'")
         else:
             print(f"Debug: Field '{field_name}' failed final verification for '{node_type}', skipping")
-    
+
+    if fields_added == 0 and verified_complex_fields:
+        field = verified_complex_fields[0]
+        field_name = field['name']
+        field_type = field.get('type', '')
+        clean_complex_type = field_type.replace('!', '').replace('[', '').replace(']', '').strip()
+        if verify_field_exists_in_type(field_name, node_type) and clean_complex_type in detailed_introspection_data:
+            sub_query = build_ultra_safe_object_query(clean_complex_type, depth + 2)
+            if sub_query and sub_query != "{ id }":
+                node_fields.append(f"{node_indent}{field_name} {sub_query}")
+                print(f"Debug: Added fallback complex field '{field_name}' to '{node_type}'")
+
     # NO complex fields for now to avoid further validation issues
     if fields_added < max_node_fields and verified_complex_fields and not limit_fields:
         # Only add ONE simple complex field and only if we're very confident
@@ -2686,64 +2718,39 @@ def build_validated_edge_query(edge_type, depth, visited_types):
 
 def determine_node_type_from_connection(connection_type):
     """
-    Determine the node type from a connection type name with enhanced accuracy
-    Fixed to handle nested connection patterns correctly
+    Determine the node type from a connection type using introspection data.
     """
-    # Handle special cases first with EXACT mappings
-    special_mappings = {
-        'AdvancedNameSearchConnection': 'Name',
-        'AdvancedTitleSearchConnection': 'Title',
-        'MainSearchResultConnection': 'MainSearchResult',
-        'ImageConnection': 'Image',  # Key fix: images connection -> Image nodes
-        'CertificateConnection': 'Certificate',
-        'PlotConnection': 'Plot',
-        'AkaConnection': 'Aka',
-        'CreditConnection': 'Credit',
-        'GenreConnection': 'Genre',
-        'LanguageConnection': 'Language',
-        'CountryConnection': 'Country',
-        'CompanyConnection': 'Company',
-        'NameKnownForConnection': 'Title',
-        'TitleCreditsConnection': 'Credit',
-        'NameImagesConnection': 'Image',
-        'TitleImagesConnection': 'Image',
-        'ImagesConnection': 'Image',        # Generic images connection -> Image
-        'CertificatesConnection': 'Certificate',
-        'PlotsConnection': 'Plot',
-        'ImageTypesConnection': 'ImageType',  # ImageTypes connection -> ImageType
-        # Add more specific mappings
-        'NewsConnection': 'News',
-        'VideoConnection': 'Video',
-        'AwardsConnection': 'Award',
-        'RelatedNamesConnection': 'Name',
-        'RelatedTitlesConnection': 'Title'
-    }
-    
-    if connection_type in special_mappings:
-        node_type = special_mappings[connection_type]
-        print(f"Debug: Using special mapping '{connection_type}' -> '{node_type}'")
-        return node_type
-    
-    # Generic pattern: remove 'Connection' suffix
-    node_type = connection_type.replace('Connection', '')
-    
-    # Check if the node type exists as-is first
-    if node_type in detailed_introspection_data:
-        print(f"Debug: Found exact node type '{node_type}' for connection '{connection_type}'")
-        return node_type
-    
-    # Handle some common patterns
-    if node_type.endswith('s') and len(node_type) > 1:
-        # Try singular form (e.g., "Images" -> "Image")
-        singular = node_type[:-1]
-        if singular in detailed_introspection_data:
-            print(f"Debug: Using singular form '{singular}' for connection '{connection_type}'")
-            return singular
-    
-    # If we can't determine it, return None so we use a safe fallback
-    print(f"Warning: Could not determine node type for connection '{connection_type}'")
-    print(f"Debug: Tried '{node_type}' and variations, none found in schema")
-    return None
+    clean_type = connection_type.replace('!', '').replace('[', '').replace(']', '').strip()
+    if clean_type not in detailed_introspection_data:
+        print(f"Warning: Connection type '{clean_type}' not found in introspection data")
+        return None
+
+    type_data = detailed_introspection_data[clean_type]
+    fields = type_data.get('fields', [])
+    # Find the 'edges' field
+    edges_field = next((f for f in fields if f['name'] == 'edges'), None)
+    if not edges_field:
+        print(f"Warning: No 'edges' field found in connection type '{clean_type}'")
+        return None
+
+    # Get the edge type (e.g., '[SomeEdgeType!]!')
+    edge_type_str = edges_field['type'].replace('!', '').replace('[', '').replace(']', '').strip()
+    if edge_type_str not in detailed_introspection_data:
+        print(f"Warning: Edge type '{edge_type_str}' not found in introspection data")
+        return None
+
+    edge_type_data = detailed_introspection_data[edge_type_str]
+    edge_fields = edge_type_data.get('fields', [])
+    # Find the 'node' field
+    node_field = next((f for f in edge_fields if f['name'] == 'node'), None)
+    if not node_field:
+        print(f"Warning: No 'node' field found in edge type '{edge_type_str}'")
+        return None
+
+    # Get the node type (e.g., 'SomeNodeType!')
+    node_type = node_field['type'].replace('!', '').replace('[', '').replace(']', '').strip()
+    print(f"Debug: Using introspection to map '{connection_type}' -> '{node_type}'")
+    return node_type
 
 
 def build_generic_connection_query(connection_type, depth, visited_types):
