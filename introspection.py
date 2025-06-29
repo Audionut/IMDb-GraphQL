@@ -655,7 +655,7 @@ def generate_markdown_report():
         print(f"Error details: {traceback.format_exc()}")
 
 
-def generate_example_query_for_type(type_name, entity_id, max_fields=5):
+def generate_example_query_for_type(type_name, entity_id, max_fields=10):
     """Generate an example query for a specific type with a given ID - with validation"""
     if type_name not in detailed_introspection_data:
         print(f"Type '{type_name}' not found in introspection data")
@@ -714,14 +714,14 @@ def generate_example_query_for_type(type_name, entity_id, max_fields=5):
         if 'Connection' in field_type:
             # Use our validated connection query builder
             connection_body = build_validated_connection_query(field_type, depth=1, visited_types={type_name}, limit_fields=True)
-            query_body_parts.append(f"    {field_name} {connection_body}")
+            query_body_parts.append(f"    {field_name}(first: 5) {connection_body}")
         else:
             # For non-connection fields, check if they need sub-selection
             if is_scalar_type_validated(field_type, field_name, type_name):
                 query_body_parts.append(f"    {field_name}")
             else:
                 # Use our validated query body builder for complex types
-                sub_body = build_query_body(field_type, depth=1, visited_types={type_name}, max_fields=5)
+                sub_body = build_query_body(field_type, depth=1, visited_types={type_name}, max_fields=10)
                 if sub_body and sub_body != "{ id }":
                     query_body_parts.append(f"    {field_name} {sub_body}")
                 else:
@@ -819,6 +819,7 @@ def generate_example_query_for_operation(operation_name, search_term):
     query_args = []
     variables = {}
     constraint_details = {}
+    var_definitions = []  # ← Move this line to the top, before the loop
 
     # Process arguments to build the query
     for arg in args:
@@ -834,6 +835,7 @@ def generate_example_query_for_operation(operation_name, search_term):
             # Build example constraints based on the constraint type
             example_constraints = build_example_constraints_for_search(constraint_type, search_term, operation_name)
             variables['constraints'] = example_constraints
+            var_definitions.append(f"$constraints: {constraint_type}")  # ← Now this will work
             constraint_details[arg_name] = {
                 'type': constraint_type,
                 'description': arg_desc,
@@ -843,34 +845,26 @@ def generate_example_query_for_operation(operation_name, search_term):
         elif arg_name in ['first', 'limit']:
             query_args.append(f"{arg_name}: $first")
             variables['first'] = 10
+            var_definitions.append(f"$first: {arg_type}")
 
         elif arg_name in ['after', 'before']:
             query_args.append(f"{arg_name}: $after")
             variables['after'] = None
+            var_definitions.append(f"$after: {arg_type}")
 
         elif 'sort' in arg_name.lower():
             sort_type = arg_type.replace('!', '').strip()
-            query_args.append(f"{arg_name}: $sort")
-            variables['sort'] = build_example_sort(sort_type, operation_name)
+            example_sort = build_example_sort(sort_type, operation_name)
+            if example_sort is not None:  # Only add if we have a valid sort
+                query_args.append(f"{arg_name}: $sort")
+                variables['sort'] = example_sort
+                var_definitions.append(f"$sort: {sort_type}")  # ← Now this will work too
 
     # Build the query body using our dynamic builder
     query_body = build_query_body(return_type, depth=0, visited_types=set())
 
-    # Create variable definitions
-    var_definitions = []
-    for arg in args:
-        arg_name = arg.get('name', '')
-        arg_type = arg.get('type', '')
-        if arg_name == 'constraints' and 'constraints' in variables:
-            constraint_type = arg_type.replace('!', '').strip()
-            var_definitions.append(f"$constraints: {constraint_type}")
-        elif arg_name == 'first' and 'first' in variables:
-            var_definitions.append(f"$first: {arg_type}")
-        elif arg_name == 'after' and 'after' in variables:
-            var_definitions.append(f"$after: {arg_type}")
-        elif 'sort' in arg_name.lower() and 'sort' in variables:
-            sort_type = arg_type.replace('!', '').strip()
-            var_definitions.append(f"$sort: {sort_type}")
+    # Remove the duplicate variable definitions creation since it's now at the top
+    # var_definitions = []  ← Remove this line
 
     # Build the complete query
     args_string = f"({', '.join(query_args)})" if query_args else ""
@@ -894,132 +888,203 @@ def generate_example_query_for_operation(operation_name, search_term):
 
 
 def build_example_constraints_for_search(constraint_type, search_term, operation_name):
-    """Build example constraints based on the constraint type and search term"""
+    """Build example constraints based on the constraint type and search term - SELECTIVE approach"""
+    print("🔍 DEBUG: build_example_constraints_for_search called with:")
+    print(f"🔍 DEBUG:   constraint_type: {constraint_type}")
+    print(f"🔍 DEBUG:   search_term: {search_term}")
+    print(f"🔍 DEBUG:   operation_name: {operation_name}")
+    
     if constraint_type not in detailed_introspection_data:
-        # Fallback constraint
+        print(f"🔍 DEBUG: Constraint type '{constraint_type}' not in schema, using fallback")
+        # Fallback constraint - ALWAYS return something with the search term
         if 'name' in operation_name.lower():
-            return {
+            fallback = {
+                "nameTextConstraint": {
+                    "searchTerm": search_term
+                }
+            }
+            print(f"🔍 DEBUG: Returning name fallback: {fallback}")
+            return fallback
+        elif 'title' in operation_name.lower():
+            fallback = {
+                "titleTextConstraint": {
+                    "searchTerm": search_term
+                }
+            }
+            print(f"🔍 DEBUG: Returning title fallback: {fallback}")
+            return fallback
+        else:
+            fallback = {"searchTerm": search_term}
+            print(f"🔍 DEBUG: Returning generic fallback: {fallback}")
+            return fallback
+
+    constraint_data = detailed_introspection_data[constraint_type]
+    constraint_fields = constraint_data.get('fields', [])
+    print(f"🔍 DEBUG: Found {len(constraint_fields)} fields in constraint type")
+
+    # SELECTIVE APPROACH: Only include the most relevant constraint for the operation
+    example_constraints = {}
+    
+    # Define safe constraint fields that we can populate with the search term
+    safe_text_constraints = [
+        "nameTextConstraint",
+        "titleTextConstraint", 
+        "searchText",
+        "textConstraint"
+    ]
+    
+    # For each operation type, prioritize specific constraints
+    if 'name' in operation_name.lower():
+        # For name searches, ONLY use nameTextConstraint
+        priority_constraints = ["nameTextConstraint"]
+    elif 'title' in operation_name.lower():
+        # For title searches, ONLY use titleTextConstraint
+        priority_constraints = ["titleTextConstraint"]
+    else:
+        # For other searches, look for any text constraint
+        priority_constraints = safe_text_constraints
+
+    print(f"🔍 DEBUG: Priority constraints for '{operation_name}': {priority_constraints}")
+
+    # Only process the priority constraints
+    for field in constraint_fields:
+        field_name = field.get('name', '')
+        field_type = field.get('type', '')
+        
+        if field_name not in priority_constraints:
+            print(f"🔍 DEBUG: Skipping non-priority field '{field_name}'")
+            continue
+        
+        print(f"🔍 DEBUG: Processing priority field '{field_name}' of type '{field_type}'")
+        
+        # Get clean type
+        clean_type = field_type.replace('!', '').replace('[', '').replace(']', '').strip()
+        
+        # Handle input objects - build them based on their actual structure
+        if clean_type in detailed_introspection_data and detailed_introspection_data[clean_type].get('kind') == 'INPUT_OBJECT':
+            print(f"🔍 DEBUG: Building nested constraint for '{field_name}' of type '{clean_type}'")
+            
+            # Get the actual fields of this input type
+            nested_type_data = detailed_introspection_data[clean_type]
+            nested_fields = nested_type_data.get('fields', [])
+            
+            nested_constraint = {}
+            for nested_field in nested_fields:
+                nested_field_name = nested_field.get('name', '')
+                nested_field_type = nested_field.get('type', '')
+                nested_clean_type = nested_field_type.replace('!', '').replace('[', '').replace(']', '').strip()
+                
+                print(f"🔍 DEBUG:   Nested field '{nested_field_name}' of type '{nested_field_type}'")
+                
+                # Only populate fields that look like search/text fields
+                if ('search' in nested_field_name.lower() or 
+                    'text' in nested_field_name.lower() or
+                        nested_field_name.lower() in ['term', 'query']):
+                    
+                    if nested_clean_type == 'String':
+                        nested_constraint[nested_field_name] = search_term
+                        print(f"🔍 DEBUG:     Added search field '{nested_field_name}' = '{search_term}'")
+                    else:
+                        print(f"🔍 DEBUG:     Skipping non-string search field '{nested_field_name}'")
+                else:
+                    print(f"🔍 DEBUG:     Skipping non-search field '{nested_field_name}'")
+            
+            if nested_constraint:
+                example_constraints[field_name] = nested_constraint
+                print(f"🔍 DEBUG: Built nested constraint for '{field_name}': {nested_constraint}")
+                # For name/title searches, stop after finding the first relevant constraint
+                if field_name in ["nameTextConstraint", "titleTextConstraint"]:
+                    print(f"🔍 DEBUG: Found primary constraint '{field_name}', stopping here")
+                    break
+            else:
+                print(f"🔍 DEBUG: No nested constraint built for '{field_name}'")
+
+    print(f"🔍 DEBUG: Final constraints: {example_constraints}")
+
+    # CRITICAL: Always return a valid constraint with the search term if we built nothing
+    if not example_constraints:
+        print("🔍 DEBUG: No constraints built, creating emergency fallback")
+        if 'name' in operation_name.lower():
+            emergency_fallback = {
                 "nameTextConstraint": {
                     "searchTerm": search_term
                 }
             }
         elif 'title' in operation_name.lower():
-            return {
+            emergency_fallback = {
                 "titleTextConstraint": {
                     "searchTerm": search_term
                 }
             }
         else:
-            return {"searchTerm": search_term}
-
-    constraint_data = detailed_introspection_data[constraint_type]
-    constraint_fields = constraint_data.get('fields', [])
-
-    example_constraints = {}
-
-    # STRICT: Only process fields that actually exist on THIS constraint type
-    for field in constraint_fields:
-        field_name = field.get('name', '')
-        field_type = field.get('type', '')
-        field_name_lower = field_name.lower()
-        is_required = field_type.endswith('!')
-
-        # Get clean type
-        clean_type = field_type.replace('!', '').replace('[', '').replace(']', '').strip()
+            emergency_fallback = {"searchTerm": search_term}
         
-        # Handle scalar types first
-        if clean_type in ['ID', 'String', 'Int', 'Boolean']:
-            if clean_type == 'ID':
-                example_constraints[field_name] = "example_id"
-            elif clean_type == 'String':
-                example_constraints[field_name] = search_term if 'search' in field_name_lower else "example"
-            elif clean_type == 'Int':
-                example_constraints[field_name] = 1
-            elif clean_type == 'Boolean':
-                example_constraints[field_name] = True
-                
-        # Handle input objects recursively
-        elif clean_type in detailed_introspection_data and detailed_introspection_data[clean_type].get('kind') == 'INPUT_OBJECT':
-            nested_example = build_example_constraints_for_search(clean_type, search_term, operation_name)
-            if nested_example:
-                example_constraints[field_name] = nested_example
-                
-        # Handle enums and other special types
-        elif clean_type in detailed_introspection_data:
-            nested_data = detailed_introspection_data[clean_type]
-            if nested_data.get('kind') == 'ENUM':
-                # For enums, only include if we have valid enum values
-                enum_values = nested_data.get('enumValues', [])
-                if enum_values and len(enum_values) > 0:
-                    first_enum_value = enum_values[0].get('name')
-                    if first_enum_value:
-                        example_constraints[field_name] = first_enum_value
-                        print(f"Debug: Using enum value '{first_enum_value}' for field '{field_name}'")
-                    else:
-                        print(f"Debug: Skipping enum field '{field_name}' - invalid enum value")
-                else:
-                    print(f"Debug: Skipping enum field '{field_name}' - no enum values available")
-                # Don't add this field to example_constraints if we don't have valid values
-                continue
-        elif 'award' in field_name_lower or 'event' in field_name_lower or 'id' in field_name_lower:
-            # Skip constraints that need real IDs for examples
-            print(f"Debug: Skipping constraint field '{field_name}' - requires real entity ID")
-            continue
-        # Smart defaults based on field names for unknown types
-        elif 'year' in field_name_lower:
-            example_constraints[field_name] = 1970
-        elif 'date' in field_name_lower:
-            if 'min' in field_name_lower or 'start' in field_name_lower:
-                example_constraints[field_name] = "1960-01-01"
-            elif 'max' in field_name_lower or 'end' in field_name_lower:
-                example_constraints[field_name] = "1970-12-31"
-            else:
-                example_constraints[field_name] = "1965-01-01"
-        elif 'gender' in field_name_lower:
-            example_constraints[field_name] = "MALE"
-        elif is_required:
-            # For required fields of unknown types, provide safe defaults
-            if clean_type == "String":
-                example_constraints[field_name] = "example"
-            elif clean_type == "Int":
-                example_constraints[field_name] = 1
-            elif clean_type == "Boolean":
-                example_constraints[field_name] = True
-            elif clean_type == "ID":
-                example_constraints[field_name] = "example_id"
+        print(f"🔍 DEBUG: Emergency fallback: {emergency_fallback}")
+        return emergency_fallback
 
-    # Only return non-empty constraints
-    return example_constraints if example_constraints else None
+    return example_constraints
 
 
 def build_example_sort(sort_type, operation_name):
     """Build an example sort object"""
+    print(f"🔍 DEBUG: build_example_sort called with sort_type='{sort_type}', operation_name='{operation_name}'")
+    
     if sort_type not in detailed_introspection_data:
-        return {
-            "sortBy": "RELEVANCE",
-            "sortOrder": "DESC"
-        }
+        print(f"🔍 DEBUG: Sort type '{sort_type}' not in schema, returning None")
+        return None
 
     sort_data = detailed_introspection_data[sort_type]
     sort_fields = sort_data.get('fields', [])
+    print(f"🔍 DEBUG: Found {len(sort_fields)} fields in sort type")
 
     example_sort = {}
+    missing_required = []
 
     for field in sort_fields:
         field_name = field.get('name', '')
+        field_type = field.get('type', '')
+        clean_type = field_type.replace('!', '').replace('[', '').replace(']', '').strip()
+        is_required = field_type.endswith('!')
+        
+        print(f"🔍 DEBUG: Processing sort field '{field_name}' of type '{field_type}' (required: {is_required})")
 
-        if 'sortby' in field_name.lower() or 'sort_by' in field_name.lower():
-            if 'name' in operation_name.lower():
-                example_sort[field_name] = "POPULARITY"
-            elif 'title' in operation_name.lower():
-                example_sort[field_name] = "USER_RATING"
+        if field_name.lower() in ['sortby', 'by']:
+            if clean_type in detailed_introspection_data and detailed_introspection_data[clean_type].get('kind') == 'ENUM':
+                enum_values = detailed_introspection_data[clean_type].get('enumValues', [])
+                if enum_values:
+                    example_sort[field_name] = enum_values[0].get('name')
+                    print(f"🔍 DEBUG: Set sort field '{field_name}' to '{enum_values[0].get('name')}'")
+                else:
+                    if is_required:
+                        missing_required.append(field_name)
+                    print(f"🔍 DEBUG: No enum values found for {clean_type}, cannot set '{field_name}'")
             else:
-                example_sort[field_name] = "RELEVANCE"
-
+                print(f"🔍 DEBUG: Sort field '{field_name}' is not an enum, skipping")
         elif 'order' in field_name.lower():
-            example_sort[field_name] = "DESC"
+            if clean_type in detailed_introspection_data and detailed_introspection_data[clean_type].get('kind') == 'ENUM':
+                enum_values = detailed_introspection_data[clean_type].get('enumValues', [])
+                if enum_values:
+                    example_sort[field_name] = enum_values[0].get('name')
+                    print(f"🔍 DEBUG: Set order field '{field_name}' to '{enum_values[0].get('name')}'")
+                else:
+                    if is_required:
+                        missing_required.append(field_name)
+                    print(f"🔍 DEBUG: No enum values found for {clean_type}, cannot set '{field_name}'")
+            else:
+                # Fallback for order fields
+                example_sort[field_name] = "DESC"
+                print(f"🔍 DEBUG: Set order field '{field_name}' to 'DESC' (fallback)")
 
-    return example_sort if example_sort else {"sortBy": "RELEVANCE", "sortOrder": "DESC"}
+    if missing_required:
+        print(f"🔍 DEBUG: Cannot generate valid sort input for '{sort_type}'. Required fields missing enum values: {missing_required}")
+        return None  # Return None so it gets omitted from variables
+    
+    if not example_sort:
+        print(f"🔍 DEBUG: No sort fields could be populated for '{sort_type}', returning None")
+        return None
+    
+    print(f"🔍 DEBUG: Final sort object: {example_sort}")
+    return example_sort
 
 
 def execute_query_and_save_result(query, variables=None, filename_prefix="query_result"):
@@ -1052,17 +1117,33 @@ def execute_query_and_save_result(query, variables=None, filename_prefix="query_
         if 200 <= response.status_code < 300:
             result = response.json()
             
-            # Save the result
+            # Save the result WITH the original query and variables
             timestamp = time.strftime('%Y%m%d_%H%M%S')
             result_filename = f"{filename_prefix}_{timestamp}.json"
             
+            # Create enhanced result that includes the query
+            enhanced_result = {
+                "metadata": {
+                    "timestamp": timestamp,
+                    "query": query,
+                    "variables": variables,
+                    "endpoint": url,
+                    "status_code": response.status_code
+                },
+                "request": {
+                    "query": query,
+                    "variables": variables
+                },
+                "response": result
+            }
+            
             with open(result_filename, 'w', encoding='utf-8') as f:
-                json.dump(result, f, indent=2, ensure_ascii=False)
+                json.dump(enhanced_result, f, indent=2, ensure_ascii=False)
             
             print("✅ Query executed successfully")
             print(f"📁 Result saved to: {result_filename}")
             
-            # Show result summary
+            # Show result summary (use the actual response data)
             if 'data' in result:
                 data = result['data']
                 if data:
@@ -1106,28 +1187,29 @@ def generate_example_with_execution(type_name, entity_id, execute_query=True):
     """
     print(f"Generating comprehensive example for {type_name} with ID: {entity_id}")
     print("=" * 80)
-    
+
     # Generate the query
     query = generate_comprehensive_example_query(type_name, entity_id, include_connections=True)
     if not query:
         print(f"❌ Could not generate query for {type_name}")
         return None
-    
+
     print("Generated Query:")
     print(query)
     print("=" * 80)
-    
+
     # Execute the query if requested
     result_data = None
     result_filename = None
-    
+
     if execute_query:
         print("🚀 Executing query against IMDb GraphQL API...")
+        print("=" * 60)
         result_data, result_filename = execute_query_and_save_result(
-            query, 
+            query,
             filename_prefix=f"example_{type_name.lower()}_{entity_id.replace(':', '_')}"
         )
-    
+
     # Save the complete example with result
     try:
         safe_entity_id = str(entity_id).replace(':', '_').replace(' ', '_')
@@ -1223,11 +1305,11 @@ def generate_example_with_execution(type_name, entity_id, execute_query=True):
                 fields = type_data.get('fields', [])
                 
                 # Show sample of fields with descriptions
-                f.write("### Sample Fields (Top 20)\n\n")
+                f.write("### Sample Fields\n\n")
                 f.write("| Field Name | Type | Description |\n")
                 f.write("|------------|------|-------------|\n")
                 
-                for field in fields[:20]:
+                for field in fields:
                     field_name = field.get('name', 'Unknown')
                     field_type = field.get('type', 'Unknown')
                     description = field.get('description', 'No description')
@@ -1239,10 +1321,7 @@ def generate_example_with_execution(type_name, entity_id, execute_query=True):
                     
                     description = description.replace('|', '\\|')
                     f.write(f"| {field_name} | {field_type} | {description} |\n")
-                
-                if len(fields) > 20:
-                    f.write(f"\n... and {len(fields) - 20} more fields\n\n")
-            
+
             # Add usage tips
             f.write("## Usage Tips\n\n")
             f.write("- This query demonstrates the structure and available data for this type\n")
@@ -1282,7 +1361,17 @@ def generate_operation_example_with_execution(operation_name, search_term, execu
     
     query = result['query']
     variables = result['variables']
+    print(f"🔍 DEBUG: Generated variables: {json.dumps(variables, indent=2)}")
     
+    # Check if constraints are properly populated
+    if variables and 'constraints' in variables:
+        constraints = variables['constraints']
+        if constraints:
+            print(f"🔍 DEBUG: Constraints contain search term: {search_term in str(constraints)}")
+        else:
+            print("🔍 DEBUG: WARNING - Constraints are empty!")
+    else:
+        print("🔍 DEBUG: WARNING - No constraints in variables!")
     print("Generated Query:")
     print(query)
     if variables:
@@ -1845,10 +1934,10 @@ def generate_comprehensive_example_query(type_name, entity_id, include_connectio
             # Use the comprehensive connection query builder instead of validated one
             connection_body = build_comprehensive_connection_query(field_type, type_name)
             if connection_body:
-                selected_fields.append(f"    {field_name}(first: 10) {connection_body}")
+                selected_fields.append(f"    {field_name}(first: 5) {connection_body}")
                 complex_added += 1
         else:
-            sub_query = build_query_body(field_type, depth + 1, visited_types={type_name}, max_fields=6)
+            sub_query = build_query_body(field_type, depth + 1, visited_types={type_name}, max_fields=10)
             if sub_query and sub_query != "{ id }":
                 selected_fields.append(f"    {field_name} {sub_query}")
                 complex_added += 1
@@ -1857,7 +1946,7 @@ def generate_comprehensive_example_query(type_name, entity_id, include_connectio
 
     # Add some regular complex fields with validation
     regular_added = 0
-    for field in regular_complex[:3]:  # Reduced to 3 for safety
+    for field in regular_complex[:6]:  # Reduced to 3 for safety
         field_name = field['name']
         field_type = field.get('type', '')
         
@@ -1866,7 +1955,7 @@ def generate_comprehensive_example_query(type_name, entity_id, include_connectio
             continue
         
         if 'Connection' not in field_type:
-            sub_query = build_query_body(field_type, depth + 1, visited_types={type_name}, max_fields=4)
+            sub_query = build_query_body(field_type, depth + 1, visited_types={type_name}, max_fields=10)
             if sub_query and sub_query != "{ id }":
                 selected_fields.append(f"    {field_name} {sub_query}")
                 regular_added += 1
@@ -1919,7 +2008,8 @@ def build_query_body(return_type, depth=0, visited_types=None, max_fields=None):
 
     # Handle Connection types specially
     if 'Connection' in clean_type:
-        return build_validated_connection_query(clean_type, depth, visited_types)
+        connection_body = build_validated_connection_query(clean_type, depth, visited_types)
+        return connection_body
 
     # Handle Edge types
     if 'Edge' in clean_type:
@@ -2015,27 +2105,29 @@ def build_query_body(return_type, depth=0, visited_types=None, max_fields=None):
     for field in priority_complex:
         if fields_added >= max_fields:
             break
-        
+
         field_name = field['name']
         field_type = field.get('type', '')
-        
+
         sub_query = build_validated_sub_query_improved(field, depth, visited_types, clean_type)
         if sub_query:
-            selected_fields.append(f"{indent}{field_name} {sub_query}")
+            if 'Connection' in field_type:
+                selected_fields.append(f"{indent}{field_name}(first: 5) {sub_query}")
+            else:
+                selected_fields.append(f"{indent}{field_name} {sub_query}")
             fields_added += 1
 
     # Add regular complex fields if we have room
     if depth < 3 and clean_type in ['Title', 'Name']:
-        for field in regular_complex[:2]:  # Limit to 2 regular complex fields
+        for field in regular_complex[:3]:  # Limit to 3 regular complex fields
             if fields_added >= max_fields:
                 break
                 
             field_name = field['name']
             sub_query = build_validated_sub_query_improved(field, depth, visited_types, clean_type)
             if sub_query:
-                if 'Connection' in field_type and not sub_query.strip().startswith('('):
-                    # If not already added, add (first: 10)
-                    selected_fields.append(f"{indent}{field_name}(first: 10) {sub_query}")
+                if 'Connection' in field_type:
+                    selected_fields.append(f"{indent}{field_name}(first: 5) {sub_query}")
                 else:
                     selected_fields.append(f"{indent}{field_name} {sub_query}")
                 fields_added += 1
@@ -2217,7 +2309,7 @@ def build_validated_sub_query_improved(field, depth, visited_types, parent_type)
     if 'Connection' in field_type:
         print(f"Debug: Building connection sub-query for field '{field['name']}' of type '{field_type}' in parent '{parent_type}'")
         connection_body = build_validated_connection_query(field_type, depth + 1, visited_types, limit_fields=True)
-        return f"(first: 10) {connection_body}"
+        return connection_body
     elif 'Edge' in field_type:
         return build_validated_edge_query(field_type, depth + 1, visited_types)
     else:
@@ -2325,133 +2417,163 @@ def build_validated_connection_query(connection_type, depth, visited_types, limi
     edge_indent = "    " * (depth + 2)
     node_indent = "    " * (depth + 3)
 
-    # Try to determine the node type from the connection
+    # Always use introspection to determine node type
     node_type = determine_node_type_from_connection(clean_type)
     print(f"Debug: For connection '{connection_type}', node_type resolved as '{node_type}'")
     
-    # CRITICAL: Validate that the node type actually exists in our schema
     if not node_type or node_type not in detailed_introspection_data:
         print(f"Warning: Node type '{node_type}' for connection '{clean_type}' not found in schema")
         return build_generic_connection_query(clean_type, depth, visited_types)
     
     print(f"Debug: Building connection for '{clean_type}' with node type '{node_type}'")
     
-    # Build node query with STRICT validation against the actual node type schema
-    node_fields = []
-    
-    # Get the ACTUAL fields from the node type's schema
+    # Get actual node fields from introspection
     node_data = detailed_introspection_data[node_type]
     actual_node_fields = node_data.get('fields', [])
-    id_field = next((f for f in actual_node_fields if f['name'] == 'id'), None)
-    if id_field:
-        node_fields.append(f"{node_indent}id")
+    node_fields = []
 
-    if not actual_node_fields:
-        print(f"Warning: No fields found for node type '{node_type}'")
-        return build_simple_connection_with_id_only(depth)
+    # DEBUG: Show what fields are available for this node type
+    field_names = [f.get('name') for f in actual_node_fields]
+    print(f"🔍 DEBUG: Node type '{node_type}' has {len(actual_node_fields)} fields: {field_names[:10]}{'...' if len(field_names) > 10 else ''}")
     
-    print(f"Debug: Node type '{node_type}' has {len(actual_node_fields)} total fields")
+    # Check if 'id' field actually exists
+    id_field = next((f for f in actual_node_fields if f['name'] == 'id'), None)
+    has_id_field = id_field is not None
+    print(f"🔍 DEBUG: Node type '{node_type}' has 'id' field: {has_id_field}")
     
-    # STRICT VALIDATION: Only use fields that actually exist in the node type
-    verified_node_fields = []
-    
-    for field in actual_node_fields:
-        #  print(f"Debug: Node type for connection '{connection_type}' is '{node_type}'")
-        #  print(f"Debug: Fields for node type '{node_type}': {[f['name'] for f in actual_node_fields]}")
-        field_name = field.get('name', '')
+    if has_id_field:
+        print(f"🔍 DEBUG: Adding 'id' field to node selection for '{node_type}'")
+        node_fields.append(f"{node_indent}id")
+    else:
+        print(f"🔍 DEBUG: No 'id' field found for '{node_type}', looking for alternatives...")
         
-        # Skip id since we already added it
-        if field_name == 'id':
-            continue
+        # Find first available scalar field
+        scalar_field = None
+        for field in actual_node_fields:
+            field_name = field.get('name')
+            field_type = field.get('type', '')
+            print(f"🔍 DEBUG: Checking field '{field_name}' of type '{field_type}'")
             
-        # Check if field has required arguments
+            if is_scalar_type_validated(field_type, field_name, node_type):
+                scalar_field = field
+                print(f"🔍 DEBUG: Found scalar field '{field_name}' as alternative to 'id'")
+                break
+        
+        if scalar_field:
+            field_name = scalar_field['name']
+            print(f"🔍 DEBUG: Using scalar field '{field_name}' instead of 'id' for '{node_type}'")
+            node_fields.append(f"{node_indent}{field_name}")
+        elif actual_node_fields:
+            # Use first available field with proper sub-selection if needed
+            fallback_field = actual_node_fields[0]
+            fallback_field_name = fallback_field['name']
+            fallback_field_type = fallback_field['type']
+            print(f"🔍 DEBUG: Using fallback field '{fallback_field_name}' of type '{fallback_field_type}' for '{node_type}'")
+            
+            clean_fallback_type = fallback_field_type.replace('!', '').replace('[', '').replace(']', '').strip()
+            
+            if is_scalar_type_validated(fallback_field_type, fallback_field_name, node_type):
+                print(f"🔍 DEBUG: Fallback field '{fallback_field_name}' is scalar, adding directly")
+                node_fields.append(f"{node_indent}{fallback_field_name}")
+            elif clean_fallback_type in detailed_introspection_data:
+                print(f"🔍 DEBUG: Fallback field '{fallback_field_name}' is complex type '{clean_fallback_type}', building sub-query")
+                sub_query = build_ultra_safe_object_query(clean_fallback_type, depth + 2)
+                node_fields.append(f"{node_indent}{fallback_field_name} {sub_query}")
+            else:
+                print(f"🔍 DEBUG: Fallback field '{fallback_field_name}' type '{clean_fallback_type}' not in schema, adding as-is")
+                node_fields.append(f"{node_indent}{fallback_field_name}")
+        else:
+            print(f"🚨 DEBUG: No fields available for node type '{node_type}' - this should not happen!")
+
+    # Only include additional fields that do not require arguments
+    verified_node_fields = []
+    for field in actual_node_fields:
+        field_name = field.get('name', '')
+        if field_name == 'id':
+            continue  # Already handled above
         args = field.get('args', [])
         required_args = [arg for arg in args if arg.get('type', '').endswith('!')]
-        
-        if not required_args:  # Only include fields without required args
+        if not required_args:
             verified_node_fields.append(field)
-    
-    print(f"Debug: Node type '{node_type}' has {len(verified_node_fields)} verified queryable fields")
-    
-    # Get only scalar fields that are VERIFIED to exist in this specific node type
+
+    print(f"🔍 DEBUG: Found {len(verified_node_fields)} additional fields without required args")
+
+    # Separate scalar and complex fields
     verified_scalar_fields = []
     verified_complex_fields = []
-    
     for field in verified_node_fields:
         field_type = field.get('type', '')
         field_name = field.get('name', '')
-        
-        # ULTRA STRICT: Verify this field actually exists in THIS specific node type
-        if not verify_field_exists_in_type(field_name, node_type):
-            print(f"Debug: Field '{field_name}' failed ultra-verification for '{node_type}', skipping")
-            continue
-        
         if is_scalar_type_validated(field_type, field_name, node_type):
             verified_scalar_fields.append(field)
         else:
             verified_complex_fields.append(field)
-    
-    print(f"Debug: Found {len(verified_scalar_fields)} verified scalar and {len(verified_complex_fields)} verified complex fields for '{node_type}'")
-    
-    # Add priority scalar fields - ONLY those verified for this node type
-    max_node_fields = 2 if limit_fields else 3  # Very conservative
-    priority_scalars, regular_scalars = prioritize_scalar_fields(verified_scalar_fields)
 
-    fields_added = 0
+    print(f"🔍 DEBUG: Categorized: {len(verified_scalar_fields)} scalar, {len(verified_complex_fields)} complex")
+
+    # Prioritize and limit fields
+    max_node_fields = 2 if limit_fields else 3
+    priority_scalars, regular_scalars = prioritize_scalar_fields(verified_scalar_fields)
+    fields_added = len(node_fields)  # Count what we already added
+    
+    print(f"🔍 DEBUG: Starting with {fields_added} fields, max allowed: {max_node_fields}")
+    
     for field in priority_scalars[:max_node_fields]:
         if fields_added >= max_node_fields:
             break
         field_name = field['name']
-        # Final verification that this field exists in THIS node type
-        if verify_field_exists_in_type(field_name, node_type):
-            node_fields.append(f"{node_indent}{field_name}")
-            fields_added += 1
-            print(f"Debug: Added verified scalar field '{field_name}' to '{node_type}'")
-        else:
-            print(f"Debug: Field '{field_name}' failed final verification for '{node_type}', skipping")
+        print(f"🔍 DEBUG: Adding priority scalar field '{field_name}'")
+        node_fields.append(f"{node_indent}{field_name}")
+        fields_added += 1
 
-    if fields_added == 0 and verified_complex_fields:
+    # Fallback: add one complex field if no scalars were added
+    if fields_added <= 1 and verified_complex_fields:  # Only if we have just id or less
         field = verified_complex_fields[0]
         field_name = field['name']
         field_type = field.get('type', '')
+        print(f"🔍 DEBUG: Adding complex field '{field_name}' as fallback")
         clean_complex_type = field_type.replace('!', '').replace('[', '').replace(']', '').strip()
-        if verify_field_exists_in_type(field_name, node_type) and clean_complex_type in detailed_introspection_data:
+        if clean_complex_type in detailed_introspection_data:
             sub_query = build_ultra_safe_object_query(clean_complex_type, depth + 2)
             if sub_query and sub_query != "{ id }":
                 node_fields.append(f"{node_indent}{field_name} {sub_query}")
-                print(f"Debug: Added fallback complex field '{field_name}' to '{node_type}'")
+                fields_added += 1
 
-    # NO complex fields for now to avoid further validation issues
-    if fields_added < max_node_fields and verified_complex_fields and not limit_fields:
-        # Only add ONE simple complex field and only if we're very confident
-        priority_complex, _ = prioritize_complex_fields(verified_complex_fields, node_type)
+    print(f"🔍 DEBUG: Final node selection for '{node_type}': {len(node_fields)} fields")
+    for i, field_line in enumerate(node_fields):
+        print(f"🔍 DEBUG:   {i+1}. {field_line.strip()}")
+
+    # CRITICAL CHECK: Ensure we have at least one field
+    if not node_fields:
+        print(f"🚨 DEBUG: ERROR - No fields selected for node type '{node_type}'!")
+        print(f"🚨 DEBUG: Available fields were: {[f.get('name') for f in actual_node_fields]}")
+        print("🚨 DEBUG: Adding emergency fallback...")
         
-        if priority_complex:
-            field = priority_complex[0]
-            field_name = field['name']
-            field_type = field.get('type', '')
-            clean_complex_type = field_type.replace('!', '').replace('[', '').replace(']', '').strip()
+        # Emergency fallback - try to add ANY field
+        if actual_node_fields:
+            emergency_field = actual_node_fields[0]
+            emergency_name = emergency_field.get('name')
+            emergency_type = emergency_field.get('type')
+            print(f"🚨 DEBUG: Using emergency field '{emergency_name}' of type '{emergency_type}'")
             
-            # ULTRA CONSERVATIVE: Only add if it's a very simple type we know about
-            if (verify_field_exists_in_type(field_name, node_type) and 
-                'Connection' not in field_type and 
-                clean_complex_type in detailed_introspection_data and
-                    clean_complex_type in ['Markdown', 'Text', 'Date', 'MonthDay', 'Year']):  # Only very safe types
-                
-                sub_query = build_ultra_safe_object_query(clean_complex_type, depth + 2)
-                if sub_query and sub_query != "{ id }":
-                    node_fields.append(f"{node_indent}{field_name} {sub_query}")
-                    print(f"Debug: Added verified complex field '{field_name}' to '{node_type}'")
-                else:
-                    print(f"Debug: Could not build safe sub-query for '{field_name}' in '{node_type}'")
+            if is_scalar_type_validated(emergency_type, emergency_name, node_type):
+                node_fields.append(f"{node_indent}{emergency_name}")
             else:
-                print(f"Debug: Complex field '{field_name}' failed ultra-strict validation for '{node_type}'")
-    
-    # Final validation: ensure we have reasonable content
-    if len(node_fields) == 1:  # Only has ID
-        print(f"Debug: Only ID field available for '{node_type}', using minimal query")
-    
-    node_query = "{\n" + "\n".join(node_fields) + f"\n{node_indent}}}"
+                # Try to build a sub-query
+                clean_emergency_type = emergency_type.replace('!', '').replace('[', '').replace(']', '').strip()
+                if clean_emergency_type in detailed_introspection_data:
+                    sub_query = build_ultra_safe_object_query(clean_emergency_type, depth + 2)
+                    node_fields.append(f"{node_indent}{emergency_name} {sub_query}")
+                else:
+                    print(f"🚨 DEBUG: Cannot build sub-query for '{emergency_name}', type '{clean_emergency_type}' not in schema")
+
+    # Build the final node query
+    if node_fields:
+        node_query = "{\n" + "\n".join(node_fields) + f"\n{node_indent}    }}"
+        print(f"🔍 DEBUG: Built node query with {len(node_fields)} fields")
+    else:
+        print("🚨 DEBUG: CRITICAL ERROR - Still no fields for node query!")
+        node_query = "{{ }}"  # This will cause a GraphQL error, but it's better than crashing
 
     connection_query = f"""{{
 {indent}edges {{
@@ -2467,6 +2589,7 @@ def build_validated_connection_query(connection_type, depth, visited_types, limi
 {indent}total
 {'    ' * depth}}}"""
 
+    print(f"🔍 DEBUG: Connection query built for '{clean_type}' -> '{node_type}'")
     return connection_query
 
 
@@ -2474,57 +2597,142 @@ def build_ultra_safe_object_query(type_name, depth):
     """
     Build an ultra-safe query for an object type with MAXIMUM field verification
     """
+    print(f"🔍 DEBUG: build_ultra_safe_object_query called for type '{type_name}' at depth {depth}")
+    
     if type_name not in detailed_introspection_data:
-        print(f"Debug: Type '{type_name}' not found in comprehensive data, using id only")
-        return "{ id }"
+        print(f"🔍 DEBUG: Type '{type_name}' not found in comprehensive data, using fallback")
+        return "{ }"  # Return empty object instead of assuming id exists
     
     type_data = detailed_introspection_data[type_name]
     actual_fields = type_data.get('fields', [])
     
     if not actual_fields:
-        print(f"Debug: No fields found for type '{type_name}', using id only")
-        return "{ id }"
+        print(f"🔍 DEBUG: No fields found for type '{type_name}', using empty object")
+        return "{ }"
+    
+    print(f"🔍 DEBUG: Type '{type_name}' has {len(actual_fields)} fields available: {[f.get('name') for f in actual_fields]}")
     
     indent = "    " * (depth + 1)
     selected_fields = []
     
-    # Always include ID if it actually exists
+    # Check if ID field actually exists
     id_field = next((f for f in actual_fields if f.get('name') == 'id'), None)
-    if id_field:
+    has_id = id_field is not None
+    print(f"🔍 DEBUG: Type '{type_name}' has 'id' field: {has_id}")
+    
+    if has_id:
+        print(f"🔍 DEBUG: Adding 'id' field to '{type_name}'")
         selected_fields.append(f"{indent}id")
     
-    # Add only 1-2 ULTRA VERIFIED scalar fields
+    # Add verified scalar fields (including when no id exists)
     verified_scalar_count = 0
-    max_safe_fields = 2  # Very conservative
+    max_safe_fields = 3 if not has_id else 2  # More fields if no id
     
     for field in actual_fields:
         if verified_scalar_count >= max_safe_fields:
             break
-            
+
         field_name = field.get('name', '')
         field_type = field.get('type', '')
-        
-        if (field_name != 'id' and 
-                is_scalar_type_validated(field_type, field_name, type_name)):
-            
-            # Check for required arguments
-            args = field.get('args', [])
-            required_args = [arg for arg in args if arg.get('type', '').endswith('!')]
-            
-            if not required_args:
-                # ULTRA STRICT verification that this field exists
-                if verify_field_exists_in_type(field_name, type_name):
-                    selected_fields.append(f"{indent}{field_name}")
-                    verified_scalar_count += 1
-                    print(f"Debug: Added ultra-verified field '{field_name}' to '{type_name}'")
+
+        if field_name == 'id':
+            continue
+
+        args = field.get('args', [])
+        required_args = [arg for arg in args if arg.get('type', '').endswith('!')]
+
+        if not required_args:
+            clean_type = field_type.replace('!', '').replace('[', '').replace(']', '').strip()
+            # Scalar or enum
+            if is_scalar_type_validated(field_type, field_name, type_name):
+                selected_fields.append(f"{indent}{field_name}")
+                verified_scalar_count += 1
+                print(f"🔍 DEBUG: Added verified scalar field '{field_name}' to '{type_name}'")
+            # Object type: add minimal sub-selection
+            elif clean_type in detailed_introspection_data:
+                # Prevent too deep nesting
+                if depth < 9:
+                    sub_query = build_ultra_safe_object_query(clean_type, depth + 1)
+                    if sub_query and sub_query.strip() and sub_query != "{ }":
+                        if 'Connection' in field_type:
+                            selected_fields.append(f"{indent}{field_name}(first: 5) {sub_query}")
+                        else:
+                            selected_fields.append(f"{indent}{field_name} {sub_query}")
+                        verified_scalar_count += 1
+                        print(f"🔍 DEBUG: Added object field '{field_name}' with sub-query to '{type_name}'")
+                    else:
+                        if 'Connection' in field_type:
+                            selected_fields.append(f"{indent}{field_name}(first: 5) {{ __typename }}")
+                        else:
+                            selected_fields.append(f"{indent}{field_name} {{ __typename }}")
+                        print(f"🔍 DEBUG: Added object field '{field_name}' with __typename fallback to '{type_name}'")
                 else:
-                    print(f"Debug: Field '{field_name}' failed ultra-verification for '{type_name}'")
+                    if clean_type in detailed_introspection_data:
+                        sub_type_data = detailed_introspection_data[clean_type]
+                        sub_fields = sub_type_data.get('fields', [])
+                        sub_indent = "    " * (depth + 2)
+                        sub_selected = []
+                        # Always include id if present
+                        id_field = next((f for f in sub_fields if f.get('name') == 'id'), None)
+                        if id_field:
+                            sub_selected.append(f"{sub_indent}id")
+                        # Add all scalar fields
+                        for sub_field in sub_fields:
+                            sub_field_name = sub_field.get('name', '')
+                            sub_field_type = sub_field.get('type', '')
+                            if sub_field_name != 'id' and is_scalar_type_validated(sub_field_type, sub_field_name, clean_type):
+                                sub_selected.append(f"{sub_indent}{sub_field_name}")
+                        # Fallback to __typename if no scalars
+                        if not sub_selected:
+                            sub_selected.append(f"{sub_indent}__typename")
+                        sub_query = "{\n" + "\n".join(sub_selected) + f"\n{indent}}}"
+                        selected_fields.append(f"{indent}{field_name} {sub_query}")
+                        print(f"🔍 DEBUG: Added object field '{field_name}' with scalar fields fallback to '{type_name}' (depth limit)")
+                    else:
+                        selected_fields.append(f"{indent}{field_name} {{ __typename }}")
+                        print(f"🔍 DEBUG: Added object field '{field_name}' with __typename fallback to '{type_name}' (depth limit, unknown type)")
     
+    # CRITICAL: If we STILL have no fields, add ANY field to prevent empty selection
+    if not selected_fields and actual_fields:
+        print(f"🚨 DEBUG: Emergency fallback for '{type_name}' - adding ANY available field")
+        
+        # Just pick the first field, regardless of type
+        emergency_field = actual_fields[0]
+        emergency_name = emergency_field.get('name', '')
+        emergency_type = emergency_field.get('type', '')
+        
+        print(f"🚨 DEBUG: Using emergency field '{emergency_name}' of type '{emergency_type}'")
+        
+        # Check if it needs sub-selection
+        clean_emergency_type = emergency_type.replace('!', '').replace('[', '').replace(']', '').strip()
+        
+        if clean_emergency_type in ['String', 'Int', 'Float', 'Boolean', 'ID']:
+            # It's a scalar, add directly
+            selected_fields.append(f"{indent}{emergency_name}")
+            print(f"🚨 DEBUG: Emergency field '{emergency_name}' is scalar")
+        elif clean_emergency_type in detailed_introspection_data:
+            # It's a complex type, build sub-query
+            sub_query = build_ultra_safe_object_query(clean_emergency_type, depth + 1)
+            if sub_query and sub_query.strip() and sub_query != "{ }":
+                selected_fields.append(f"{indent}{emergency_name} {sub_query}")
+                print(f"🚨 DEBUG: Emergency field '{emergency_name}' with sub-query")
+            else:
+                # Sub-query failed, add as scalar anyway (will cause error but better than empty)
+                selected_fields.append(f"{indent}{emergency_name}")
+                print(f"🚨 DEBUG: Emergency field '{emergency_name}' added as scalar (may cause error)")
+        else:
+            # Unknown type, add as scalar anyway
+            selected_fields.append(f"{indent}{emergency_name}")
+            print(f"🚨 DEBUG: Emergency field '{emergency_name}' added as unknown scalar")
+    
+    # Final check
     if not selected_fields:
-        return "{ id }"
+        print(f"🚨 DEBUG: STILL no fields for '{type_name}' - this should never happen!")
+        print("🚨 DEBUG: Will return empty object and cause GraphQL error")
+        return "{ }"
     
     result = "{\n" + "\n".join(selected_fields) + f"\n{'    ' * depth}}}"
-    print(f"Debug: Built ultra-safe query for '{type_name}' with {len(selected_fields)} fields")
+    print(f"🔍 DEBUG: Built ultra-safe query for '{type_name}' with {len(selected_fields)} fields")
     return result
 
 
@@ -2532,8 +2740,10 @@ def verify_field_exists_in_type(field_name, type_name):
     """
     ULTRA STRICT verification that a field actually exists in the specified type's schema
     """
+    print(f"🔍 DEBUG: verify_field_exists_in_type('{field_name}', '{type_name}')")
+    
     if type_name not in detailed_introspection_data:
-        print(f"Debug: Type '{type_name}' not in comprehensive data")
+        print(f"🔍 DEBUG: Type '{type_name}' not in comprehensive data")
         return False
     
     type_data = detailed_introspection_data[type_name]
@@ -2543,10 +2753,11 @@ def verify_field_exists_in_type(field_name, type_name):
     field_names = {f.get('name') for f in actual_fields if f.get('name')}
     exists = field_name in field_names
     
+    print(f"🔍 DEBUG: Field '{field_name}' exists in '{type_name}': {exists}")
+    
     if not exists:
-        print(f"Debug: Field '{field_name}' does NOT exist in type '{type_name}'")
         available_fields = sorted(list(field_names))
-        print(f"Debug: Available fields in '{type_name}': {available_fields[:5]}{'...' if len(available_fields) > 5 else ''}")
+        print(f"🔍 DEBUG: Available fields in '{type_name}': {available_fields[:5]}{'...' if len(available_fields) > 5 else ''}")
     
     return exists
 
@@ -2757,14 +2968,19 @@ def build_generic_connection_query(connection_type, depth, visited_types):
     """
     Build a generic connection query when we don't have schema data
     """
+    print(f"🔍 DEBUG: build_generic_connection_query called for '{connection_type}'")
+    
     indent = "    " * (depth + 1)
     edge_indent = "    " * (depth + 2)
     node_indent = "    " * (depth + 3)
 
+    # DON'T assume id exists - use empty node selection
+    print("🔍 DEBUG: Generic connection - using empty node selection (no id assumption)")
+
     generic_query = f"""{{
 {indent}edges {{
 {edge_indent}node {{
-{node_indent}id
+{node_indent}
 {edge_indent}}}
 {edge_indent}cursor
 {indent}}}
@@ -2777,6 +2993,7 @@ def build_generic_connection_query(connection_type, depth, visited_types):
 {indent}total
 {'    ' * depth}}}"""
 
+    print("🔍 DEBUG: Built generic connection query with empty node")
     return generic_query
 
 
