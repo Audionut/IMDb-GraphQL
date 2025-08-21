@@ -1,3 +1,5 @@
+This repo is going archive, see https://github.com/MiM-MiM/MyMovieGraphQLPy instead.
+
 # General Information
 introspection.py is a utility to find all of the IMDb GraphQL API objects.
 
